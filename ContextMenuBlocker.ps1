@@ -22,6 +22,11 @@
 .EXAMPLE
     .\ContextMenuBlocker.ps1 -BlockAll -NoPrompt
     Blocks all entries without prompts (for automation)
+
+.NOTES
+    v1.3 - ASCII fallback: auto-detects raster font, renders clean ASCII if needed
+    v1.2 - Encoding fix: all non-ASCII UI chars generated via [char] code points
+    v1.1 - Patched exit calls to allow paste-into-console usage
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
@@ -41,18 +46,118 @@ param(
     [switch]$NoRestartExplorer
 )
 
-#region ═══════════════════════════════════════════════════════════════════════════
+#region ========================================================================
+#                       BOX-DRAWING CHARACTER TABLE
+#  Generated at runtime from Unicode code points so the .ps1 file stays ASCII.
+#endregion =====================================================================
+
+# Detect whether the console can render Unicode box-drawing glyphs.
+# Raster Fonts (the PS5.1 default) cannot; TrueType fonts (Consolas,
+# Lucida Console, Cascadia) can.  We check the console font family
+# via P/Invoke -- if unavailable or raster, fall back to ASCII.
+
+$Script:UseUnicode = $true
+try {
+    $consoleFont = $null
+    # Try .NET call available in PS5.1 conhost
+    Add-Type -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetCurrentConsoleFontEx(
+    IntPtr hConsoleOutput,
+    bool bMaximumWindow,
+    ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct CONSOLE_FONT_INFOEX {
+    public uint cbSize;
+    public uint nFont;
+    public short dwFontSizeX;
+    public short dwFontSizeY;
+    public int FontFamily;
+    public int FontWeight;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string FaceName;
+}
+'@ -Name ConsoleHelper -Namespace Win32 -ErrorAction Stop
+
+    $fontInfo = New-Object Win32.ConsoleHelper+CONSOLE_FONT_INFOEX
+    $fontInfo.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($fontInfo)
+    $handle = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(0)
+    # STD_OUTPUT_HANDLE = -11
+    $handle = (Add-Type -MemberDefinition '[DllImport("kernel32.dll")]public static extern IntPtr GetStdHandle(int nStdHandle);' -Name Kernel32 -Namespace Win32Get -PassThru -ErrorAction Stop)::GetStdHandle(-11)
+    $null = [Win32.ConsoleHelper]::GetCurrentConsoleFontEx($handle, $false, [ref]$fontInfo)
+    $consoleFont = $fontInfo.FaceName
+
+    # Raster font reports empty or "Terminal"
+    if ([string]::IsNullOrWhiteSpace($consoleFont) -or $consoleFont -eq 'Terminal') {
+        $Script:UseUnicode = $false
+    }
+}
+catch {
+    # If P/Invoke fails (ISE, VS Code terminal, etc.) assume Unicode is fine
+    $Script:UseUnicode = $true
+}
+
+if ($Script:UseUnicode) {
+    $Script:B = @{
+        TL  = [string][char]0x2554   # double top-left
+        TR  = [string][char]0x2557   # double top-right
+        BL  = [string][char]0x255A   # double bottom-left
+        BR  = [string][char]0x255D   # double bottom-right
+        H   = [string][char]0x2550   # double horizontal
+        V   = [string][char]0x2551   # double vertical
+        LT  = [string][char]0x2560   # double left-tee
+        RT  = [string][char]0x2563   # double right-tee
+        sTL = [string][char]0x250C   # single top-left
+        sTR = [string][char]0x2510   # single top-right
+        sBL = [string][char]0x2514   # single bottom-left
+        sBR = [string][char]0x2518   # single bottom-right
+        sH  = [string][char]0x2500   # single horizontal
+        sV  = [string][char]0x2502   # single vertical
+        sLT = [string][char]0x251C   # single left-tee
+        sRT = [string][char]0x2524   # single right-tee
+        Blk = [string][char]0x25A0   # filled square
+        Emp = [string][char]0x25A1   # empty square
+        FB  = [string][char]0x2588   # full block
+        Arr = [string][char]0x2190   # left arrow
+    }
+} else {
+    $Script:B = @{
+        TL  = "+"    # double top-left
+        TR  = "+"    # double top-right
+        BL  = "+"    # double bottom-left
+        BR  = "+"    # double bottom-right
+        H   = "="    # double horizontal
+        V   = "|"    # double vertical
+        LT  = "+"    # double left-tee
+        RT  = "+"    # double right-tee
+        sTL = "+"    # single top-left
+        sTR = "+"    # single top-right
+        sBL = "+"    # single bottom-left
+        sBR = "+"    # single bottom-right
+        sH  = "-"    # single horizontal
+        sV  = "|"    # single vertical
+        sLT = "+"    # single left-tee
+        sRT = "+"    # single right-tee
+        Blk = "[X]"  # filled square
+        Emp = "[ ]"  # empty square
+        FB  = "#"    # full block
+        Arr = "<-"   # left arrow
+    }
+}
+
+#region ========================================================================
 #                              CONFIGURATION SECTION
 #  Modify these values to target different applications or customize behavior
-#endregion ═══════════════════════════════════════════════════════════════════════
+#endregion =====================================================================
 
 $Script:Config = @{
-    # ══════════════════════════════════════════════════════════════════════════════
+    # =========================================================================
     # APPLICATION PROFILE
-    # ══════════════════════════════════════════════════════════════════════════════
+    # =========================================================================
     # To target a DIFFERENT application, modify ONLY this section.
     # Everything below "PATHS" and "BEHAVIOR OPTIONS" is application-agnostic.
-    # ══════════════════════════════════════════════════════════════════════════════
+    # =========================================================================
     
     # Display name for menus and logs
     AppName = "Dropbox"
@@ -70,9 +175,9 @@ $Script:Config = @{
     # Set to $null to use raw verb IDs as descriptions
     VerbParseRegex = 'Dropbox\d*(.+?)(?:Command)?\d*$'
     
-    # ──────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # PATHS
-    # ──────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     
     # Base path for WindowsApps (usually don't change)
     WindowsAppsPath = "$env:ProgramFiles\WindowsApps"
@@ -80,9 +185,9 @@ $Script:Config = @{
     # Registry path for blocked shell extensions (don't change)
     BlockedExtensionsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked"
     
-    # ──────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # BEHAVIOR OPTIONS
-    # ──────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     
     # Automatically restart Explorer after changes? (true/false)
     # If false, will prompt user
@@ -98,12 +203,12 @@ $Script:Config = @{
     BackupPath = Join-Path $env:USERPROFILE "ContextMenuBlocker_Backups"
 }
 
-#endregion ═══════════════════════════════════════════════════════════════════════
+#endregion =====================================================================
 
-#region ═══════════════════════════════════════════════════════════════════════════
+#region ========================================================================
 #                                CORE FUNCTIONS
 
-#endregion ═══════════════════════════════════════════════════════════════════════
+#endregion =====================================================================
 
 function Write-Log {
     <#
@@ -192,13 +297,13 @@ function Invoke-SelfElevation {
         
         try {
             Start-Process $psHost -ArgumentList $arguments -Verb RunAs -ErrorAction Stop
-            exit 0
+            return
         }
         catch {
             Write-Log "Failed to elevate privileges: $_" -Level Error
             Write-Log "Please run this script as Administrator" -Level Error
             if (-not $NoPrompt) { Read-Host "Press Enter to exit" }
-            exit 1
+            return
         }
     }
 }
@@ -624,12 +729,12 @@ function Import-BlockerState {
     }
 }
 
-#region ═══════════════════════════════════════════════════════════════════════════
+#region ========================================================================
 #                                UI FUNCTIONS
 
-#endregion ═══════════════════════════════════════════════════════════════════════
+#endregion =====================================================================
 
-# ── Fixed width constant for all box rendering ──
+# -- Fixed width constant for all box rendering --
 $Script:BoxWidth = 69
 
 function Write-BoxLine {
@@ -640,7 +745,7 @@ function Write-BoxLine {
     #>
     param(
         [array]$Segments,
-        [string]$BorderChar = "║",
+        [string]$BorderChar = $Script:B.V,
         [string]$BorderColor = "White",
         [string]$Pad = " ",
         [int]$Indent = 2
@@ -671,9 +776,9 @@ function Write-BoxBorder {
         Renders a horizontal border line (top, middle, or bottom) of a box.
     #>
     param(
-        [string]$Left = "╔",
-        [string]$Fill = "═",
-        [string]$Right = "╗",
+        [string]$Left  = $Script:B.TL,
+        [string]$Fill  = $Script:B.H,
+        [string]$Right = $Script:B.TR,
         [string]$Color = "White",
         [int]$Indent = 2
     )
@@ -687,7 +792,7 @@ function Write-BoxEmpty {
         Renders an empty line inside a box (border + spaces + border).
     #>
     param(
-        [string]$BorderChar = "║",
+        [string]$BorderChar = $Script:B.V,
         [string]$BorderColor = "White",
         [int]$Indent = 2
     )
@@ -696,33 +801,76 @@ function Write-BoxEmpty {
 }
 
 function Show-Banner {
-    # Banner uses a wider width (76) for the ASCII art block only
+    if ($Script:UseUnicode) {
+        Show-BannerUnicode
+    } else {
+        Show-BannerAscii
+    }
+}
+
+function Show-BannerUnicode {
+    $f = $Script:B.FB
+    $t = $Script:B.TL
+    $b = $Script:B.BR
+    $h = $Script:B.H
+    $v = $Script:B.V
+
     $bannerWidth = 76
 
     Write-Host ""
-    Write-Host "  ╔$('═' * $bannerWidth)╗" -ForegroundColor Cyan
+    Write-Host "  $($Script:B.TL)$($Script:B.H * $bannerWidth)$($Script:B.TR)" -ForegroundColor Cyan
 
     $bannerLines = @(
         "",
-        "   ███████╗██╗  ██╗███████╗██╗     ██╗          ███████╗██╗  ██╗████████╗   ",
-        "   ██╔════╝██║  ██║██╔════╝██║     ██║          ██╔════╝╚██╗██╔╝╚══██╔══╝   ",
-        "   ███████╗███████║█████╗  ██║     ██║          █████╗   ╚███╔╝    ██║      ",
-        "   ╚════██║██╔══██║██╔══╝  ██║     ██║          ██╔══╝   ██╔██╗    ██║      ",
-        "   ███████║██║  ██║███████╗███████╗███████╗     ███████╗██╔╝ ██╗   ██║      ",
-        "   ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝     ╚══════╝╚═╝  ╚═╝   ╚═╝      ",
+        "   $f$f$f$f$f$f$f$t$f$f$t  $f$f$t$f$f$f$f$f$f$f$t$f$f$t     $f$f$t          $f$f$f$f$f$f$f$t$f$f$t  $f$f$t$f$f$f$f$f$f$f$f$t   ",
+        "   $f$f$t$h$h$h$h$b$f$f$t  $f$f$t$f$f$t$h$h$h$h$b$f$f$t     $f$f$t          $f$f$t$h$h$h$h$b$($Script:B.BL)$f$f$t$f$f$t$b$($Script:B.BL)$h$h$f$f$t$h$h$b   ",
+        "   $f$f$f$f$f$f$f$t$f$f$f$f$f$f$f$t$f$f$f$f$f$t  $f$f$t     $f$f$t          $f$f$f$f$f$t   $($Script:B.BL)$f$f$f$t$b    $f$f$t      ",
+        "   $($Script:B.BL)$h$h$h$h$f$f$t$f$f$t$h$h$f$f$t$f$f$t$h$h$b  $f$f$t     $f$f$t          $f$f$t$h$h$b   $f$f$t$f$f$t    $f$f$t      ",
+        "   $f$f$f$f$f$f$f$t$f$f$t  $f$f$t$f$f$f$f$f$f$f$t$f$f$f$f$f$f$f$t$f$f$f$f$f$f$f$t     $f$f$f$f$f$f$f$t$f$f$t$b $f$f$t   $f$f$t      ",
+        "   $($Script:B.BL)$h$h$h$h$h$h$b$($Script:B.BL)$b  $($Script:B.BL)$b$($Script:B.BL)$h$h$h$h$h$h$b$($Script:B.BL)$h$h$h$h$h$h$b$($Script:B.BL)$h$h$h$h$h$h$b     $($Script:B.BL)$h$h$h$h$h$h$b$($Script:B.BL)$b  $($Script:B.BL)$b   $($Script:B.BL)$b      ",
         "",
         "                      Context Menu Blocker                                  ",
         ""
     )
 
     foreach ($line in $bannerLines) {
-        $padded = $line.PadRight($bannerWidth).Substring(0, $bannerWidth)
-        Write-Host "  ║" -ForegroundColor Cyan -NoNewline
+        $padded = $line.PadRight($bannerWidth)
+        if ($padded.Length -gt $bannerWidth) { $padded = $padded.Substring(0, $bannerWidth) }
+        Write-Host "  $($Script:B.V)" -ForegroundColor Cyan -NoNewline
         Write-Host $padded -ForegroundColor Cyan -NoNewline
-        Write-Host "║" -ForegroundColor Cyan
+        Write-Host "$($Script:B.V)" -ForegroundColor Cyan
     }
 
-    Write-Host "  ╚$('═' * $bannerWidth)╝" -ForegroundColor Cyan
+    Write-Host "  $($Script:B.BL)$($Script:B.H * $bannerWidth)$($Script:B.BR)" -ForegroundColor Cyan
+}
+
+function Show-BannerAscii {
+    $w = 76
+
+    Write-Host ""
+    Write-Host "  +$('=' * $w)+" -ForegroundColor Cyan
+
+    $asciiLines = @(
+        "",
+        "    ____  _   _ _____ _     _          _____  ____  _____",
+        "   / ___|| | | | ____| |   | |        | ____|\ \/ /|_   _|",
+        "   \___ \| |_| |  _| | |   | |        |  _|   \  /   | |",
+        "    ___) |  _  | |___| |___| |___     | |___  /  \   | |",
+        "   |____/|_| |_|_____|_____|_____|    |_____|/_/\_\  |_|",
+        "",
+        "                    Context Menu Blocker",
+        ""
+    )
+
+    foreach ($line in $asciiLines) {
+        $padded = $line.PadRight($w)
+        if ($padded.Length -gt $w) { $padded = $padded.Substring(0, $w) }
+        Write-Host "  |" -ForegroundColor Cyan -NoNewline
+        Write-Host $padded -ForegroundColor Cyan -NoNewline
+        Write-Host "|" -ForegroundColor Cyan
+    }
+
+    Write-Host "  +$('=' * $w)+" -ForegroundColor Cyan
 }
 
 function Show-MainMenu {
@@ -741,34 +889,34 @@ function Show-MainMenu {
     
     $visibleColor = if ($visibleCount -eq 0) { "DarkGray" } else { "Red" }
     
-    # ── Info Box (DarkGray, ┌┐└┘ style) ──
+    # -- Info Box (DarkGray, single-line style) --
     Write-Host ""
-    Write-BoxBorder -Left "┌" -Fill "─" -Right "┐" -Color DarkGray
+    Write-BoxBorder -Left $Script:B.sTL -Fill $Script:B.sH -Right $Script:B.sTR -Color DarkGray
     
-    Write-BoxLine -BorderChar "│" -BorderColor DarkGray -Segments @(
+    Write-BoxLine -BorderChar $Script:B.sV -BorderColor DarkGray -Segments @(
         @{ Text = "Target Application: "; Color = "White" },
         @{ Text = "$($Script:Config.AppName)"; Color = "Cyan" }
     )
     
-    Write-BoxLine -BorderChar "│" -BorderColor DarkGray -Segments @(
+    Write-BoxLine -BorderChar $Script:B.sV -BorderColor DarkGray -Segments @(
         @{ Text = "Package Version:    "; Color = "White" },
         @{ Text = "$($SelectedPackage.Version)"; Color = "Cyan" }
     )
     
-    Write-BoxBorder -Left "├" -Fill "─" -Right "┤" -Color DarkGray
+    Write-BoxBorder -Left $Script:B.sLT -Fill $Script:B.sH -Right $Script:B.sRT -Color DarkGray
     
-    Write-BoxLine -BorderChar "│" -BorderColor DarkGray -Segments @(
+    Write-BoxLine -BorderChar $Script:B.sV -BorderColor DarkGray -Segments @(
         @{ Text = "Context Menu Entries: "; Color = "White" },
         @{ Text = "$totalCount total"; Color = "White" },
-        @{ Text = " │ "; Color = "DarkGray" },
+        @{ Text = " $($Script:B.sV) "; Color = "DarkGray" },
         @{ Text = "$blockedCount blocked"; Color = "Green" },
-        @{ Text = " │ "; Color = "DarkGray" },
+        @{ Text = " $($Script:B.sV) "; Color = "DarkGray" },
         @{ Text = "$visibleCount visible"; Color = $visibleColor }
     )
     
-    Write-BoxBorder -Left "└" -Fill "─" -Right "┘" -Color DarkGray
+    Write-BoxBorder -Left $Script:B.sBL -Fill $Script:B.sH -Right $Script:B.sBR -Color DarkGray
     
-    # ── Main Menu Box (White, ╔╗╚╝ style) ──
+    # -- Main Menu Box (White, double-line style) --
     Write-Host ""
     Write-BoxBorder
     
@@ -776,7 +924,7 @@ function Show-MainMenu {
         @{ Text = "                         MAIN MENU"; Color = "White" }
     )
     
-    Write-BoxBorder -Left "╠" -Fill "═" -Right "╣"
+    Write-BoxBorder -Left $Script:B.LT -Fill $Script:B.H -Right $Script:B.RT
     Write-BoxEmpty
     
     Write-BoxLine -Segments @(
@@ -841,7 +989,7 @@ function Show-MainMenu {
     )
     
     Write-BoxEmpty
-    Write-BoxBorder -Left "╚" -Fill "═" -Right "╝"
+    Write-BoxBorder -Left $Script:B.BL -Fill $Script:B.H -Right $Script:B.BR
     Write-Host ""
     
     return Read-Host "  Select option"
@@ -855,11 +1003,11 @@ function Show-EntryList {
     )
     
     Write-Host ""
-    Write-BoxBorder -Left "╔" -Fill "═" -Right "╗" -Color Cyan
-    Write-BoxLine -BorderChar "║" -BorderColor Cyan -Pad "" -Segments @(
+    Write-BoxBorder -Left $Script:B.TL -Fill $Script:B.H -Right $Script:B.TR -Color Cyan
+    Write-BoxLine -BorderChar $Script:B.V -BorderColor Cyan -Pad "" -Segments @(
         @{ Text = "                        CONTEXT MENU ENTRIES"; Color = "Cyan" }
     )
-    Write-BoxBorder -Left "╚" -Fill "═" -Right "╝" -Color Cyan
+    Write-BoxBorder -Left $Script:B.BL -Fill $Script:B.H -Right $Script:B.BR -Color Cyan
     
     $cloudEntries = @($Entries | Where-Object { $_.Category -eq "CloudFiles" })
     $fileExplorerEntries = @($Entries | Where-Object { $_.Category -eq "FileExplorer" })
@@ -870,16 +1018,16 @@ function Show-EntryList {
     if ($cloudFill -lt 0) { $cloudFill = 0 }
     
     Write-Host ""
-    Write-Host "  ┌─$cloudHeader$('─' * $cloudFill)┐" -ForegroundColor Yellow
-    Write-BoxLine -BorderChar "│" -BorderColor Yellow -Pad " " -Segments @(
+    Write-Host "  $($Script:B.sTL)$($Script:B.sH)$cloudHeader$($Script:B.sH * $cloudFill)$($Script:B.sTR)" -ForegroundColor Yellow
+    Write-BoxLine -BorderChar $Script:B.sV -BorderColor Yellow -Pad " " -Segments @(
         @{ Text = "These appear only when right-clicking inside the $($Script:Config.AppName) folder"; Color = "DarkGray" }
     )
-    Write-Host "  └$('─' * $Script:BoxWidth)┘" -ForegroundColor Yellow
+    Write-Host "  $($Script:B.sBL)$($Script:B.sH * $Script:BoxWidth)$($Script:B.sBR)" -ForegroundColor Yellow
     Write-Host ""
     
     foreach ($entry in $cloudEntries) {
         $isBlocked = Get-BlockedStatus -Clsid $entry.Clsid
-        $statusIcon = if ($isBlocked) { "■" } else { "□" }
+        $statusIcon = if ($isBlocked) { $Script:B.Blk } else { $Script:B.Emp }
         $statusText = if ($isBlocked) { "BLOCKED" } else { "VISIBLE" }
         $statusColor = if ($isBlocked) { "Green" } else { "Red" }
         
@@ -897,16 +1045,16 @@ function Show-EntryList {
     if ($feFill -lt 0) { $feFill = 0 }
     
     Write-Host ""
-    Write-Host "  ┌─$feHeader$('─' * $feFill)┐" -ForegroundColor Yellow
-    Write-BoxLine -BorderChar "│" -BorderColor Yellow -Pad " " -Segments @(
+    Write-Host "  $($Script:B.sTL)$($Script:B.sH)$feHeader$($Script:B.sH * $feFill)$($Script:B.sTR)" -ForegroundColor Yellow
+    Write-BoxLine -BorderChar $Script:B.sV -BorderColor Yellow -Pad " " -Segments @(
         @{ Text = "These appear on ALL files and folders everywhere"; Color = "DarkGray" }
     )
-    Write-Host "  └$('─' * $Script:BoxWidth)┘" -ForegroundColor Yellow
+    Write-Host "  $($Script:B.sBL)$($Script:B.sH * $Script:BoxWidth)$($Script:B.sBR)" -ForegroundColor Yellow
     Write-Host ""
     
     foreach ($entry in $fileExplorerEntries) {
         $isBlocked = Get-BlockedStatus -Clsid $entry.Clsid
-        $statusIcon = if ($isBlocked) { "■" } else { "□" }
+        $statusIcon = if ($isBlocked) { $Script:B.Blk } else { $Script:B.Emp }
         $statusText = if ($isBlocked) { "BLOCKED" } else { "VISIBLE" }
         $statusColor = if ($isBlocked) { "Green" } else { "Red" }
         
@@ -919,8 +1067,8 @@ function Show-EntryList {
     }
     
     Write-Host ""
-    Write-BoxBorder -Left "╔" -Fill "═" -Right "╗" -Color Cyan
-    Write-BoxBorder -Left "╚" -Fill "═" -Right "╝" -Color Cyan
+    Write-BoxBorder -Left $Script:B.TL -Fill $Script:B.H -Right $Script:B.TR -Color Cyan
+    Write-BoxBorder -Left $Script:B.BL -Fill $Script:B.H -Right $Script:B.BR -Color Cyan
     Write-Host ""
 }
 
@@ -932,11 +1080,11 @@ function Invoke-SelectiveBlocking {
     )
     
     Write-Host ""
-    Write-BoxBorder -Left "╔" -Fill "═" -Right "╗" -Color Cyan
-    Write-BoxLine -BorderChar "║" -BorderColor Cyan -Pad "" -Segments @(
+    Write-BoxBorder -Left $Script:B.TL -Fill $Script:B.H -Right $Script:B.TR -Color Cyan
+    Write-BoxLine -BorderChar $Script:B.V -BorderColor Cyan -Pad "" -Segments @(
         @{ Text = "                       SELECTIVE BLOCKING MODE"; Color = "Cyan" }
     )
-    Write-BoxBorder -Left "╚" -Fill "═" -Right "╝" -Color Cyan
+    Write-BoxBorder -Left $Script:B.BL -Fill $Script:B.H -Right $Script:B.BR -Color Cyan
     Write-Host ""
     Write-Host "  For each entry, press:" -ForegroundColor Yellow
     Write-Host "    [B] Block   [U] Unblock   [S] Skip   [Q] Quit" -ForegroundColor White
@@ -1014,7 +1162,7 @@ function Show-PackageList {
     
     for ($i = 0; $i -lt $Packages.Count; $i++) {
         $pkg = $Packages[$i]
-        $marker = if ($i -eq 0) { " ← ACTIVE (newest)" } else { "" }
+        $marker = if ($i -eq 0) { " $($Script:B.Arr) ACTIVE (newest)" } else { "" }
         $color = if ($i -eq 0) { "Green" } else { "DarkGray" }
         
         Write-Host "    $($i + 1). " -ForegroundColor White -NoNewline
@@ -1035,25 +1183,23 @@ function Wait-KeyPress {
     $null = [Console]::ReadKey($true)
 }
 
-#region ═══════════════════════════════════════════════════════════════════════════
+#region ========================================================================
 #                                MAIN ENTRY POINT
 
 function Main {
-    # Elevate if needed
-    Invoke-SelfElevation
     
     # Initialize
     if (-not (Initialize-Environment)) {
         Write-Log "Initialization failed" -Level Error
         if (-not $NoPrompt) { Wait-KeyPress "Press any key to exit..." }
-        exit 1
+        return
     }
     
     Write-Log "Script started - Target: $($Script:Config.AppName)" -Level Info
     
-    # ─────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # NON-INTERACTIVE MODE
-    # ─────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     
     if ($BlockAll -or $UnblockAll) {
         # Find packages
@@ -1061,7 +1207,7 @@ function Main {
         
         if ($packages.Count -eq 0) {
             Write-Log "No $($Script:Config.AppName) packages found" -Level Error
-            exit 1
+            return
         }
         
         $selectedPackage = $packages[0]
@@ -1072,7 +1218,7 @@ function Main {
         
         if ($entries.Count -eq 0) {
             Write-Log "No context menu entries found" -Level Error
-            exit 1
+            return
         }
         
         Write-Log "Found $($entries.Count) context menu entries" -Level Info
@@ -1099,12 +1245,12 @@ function Main {
             Restart-ExplorerShell -Force
         }
         
-        exit 0
+        return
     }
     
-    # ─────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # INTERACTIVE MODE
-    # ─────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     
     while ($true) {
         Clear-Host
@@ -1117,12 +1263,12 @@ function Main {
             Write-Log "No $($Script:Config.AppName) packages found in WindowsApps" -Level Error
             Write-Host ""
             Write-Host "  Possible causes:" -ForegroundColor Yellow
-            Write-Host "    • $($Script:Config.AppName) is not installed from Microsoft Store" -ForegroundColor White
-            Write-Host "    • The package pattern may have changed" -ForegroundColor White
-            Write-Host "    • Insufficient permissions to read WindowsApps" -ForegroundColor White
+            Write-Host "    * $($Script:Config.AppName) is not installed from Microsoft Store" -ForegroundColor White
+            Write-Host "    * The package pattern may have changed" -ForegroundColor White
+            Write-Host "    * Insufficient permissions to read WindowsApps" -ForegroundColor White
             Write-Host ""
             Wait-KeyPress "Press any key to exit..."
-            exit 1
+            return
         }
         
         Show-PackageList -Packages $packages
@@ -1246,7 +1392,7 @@ function Main {
             "0" {
                 # Exit
                 Write-Log "Exiting..." -Level Info
-                exit 0
+                return
             }
             
             default {
@@ -1257,7 +1403,9 @@ function Main {
     }
 }
 
-#endregion ═══════════════════════════════════════════════════════════════════════
+#endregion =====================================================================
 
 # Start script
 Main
+Write-Host ""
+Write-Host "Script finished. You may close this window or continue using the shell." -ForegroundColor DarkGray
